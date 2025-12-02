@@ -13,7 +13,7 @@ Antes de realizar o build do projeto necessita-se instalar a biblioteca esp32-ca
 
 o driver não é registrado como componente do ESP-IDF.
 
-1. Adicione a pasta components/esp32-camera ao projeto
+1. Adicione a pasta components ao projeto
 
 2. Clone o repositorio https://github.com/espressif/esp32-camera
 

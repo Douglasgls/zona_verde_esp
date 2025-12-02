@@ -1,19 +1,33 @@
-#include <esp_system.h>
-#include <nvs_flash.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include <esp_system.h>
+#include <nvs_flash.h>
+#include "esp_log.h"
+#include "mqtt_client.h"
 
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
 #include "driver/sdmmc_defs.h"
 #include "sdmmc_cmd.h"
 #include "esp_vfs_fat.h"
+#include "esp_http_client.h"
 
 #include "esp_camera.h"
 
-#define BUTTON_PIN 3
+static const char *TAG = "MAIN";
 
-static const char *TAG = "example:take_picture";
+
+// Meu servidor
+#define UPLOAD_URL "http://seu-servidor.com/upload"  
+
+// wifi
+#define WIFI_SSID      "DOUGLAS_VLINK"
+#define WIFI_PASSWORD  "06191005c"
+
+
 
 // camera CAMERA_MODEL_AI_THINKER 
 
@@ -41,6 +55,116 @@ static const char *TAG = "example:take_picture";
 #define CONFIG_OV3660_SUPPORT 1
 #define CONFIG_OV5640_SUPPORT 1
 
+
+/********************* WIFI *************************/
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "WiFi desconectado, tentando reconectar...");
+        esp_wifi_connect();
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "WiFi conectado! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+void wifi_init(void)
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+        },
+    };
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
+    esp_wifi_start();
+}
+
+/********************* MQTT *************************/
+static esp_mqtt_client_handle_t mqtt_client;
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
+{
+    esp_mqtt_event_handle_t event = event_data;
+
+    switch (event->event_id) {
+
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT conectado!");
+
+            esp_mqtt_client_subscribe(event->client, "tirarfoto/acao");
+
+            break;
+            
+        // HABILITAR SOMENTE QUANDO REALIZAR O RESTO DOS TESTES
+        // case MQTT_EVENT_DATA:
+        //     ESP_LOGI(TAG, "MQTT DATA RECEBIDA!");
+        //     printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
+        //     printf("DATA=%.*s\r\n", event->data_len, event->data);
+
+        //     if (strncmp(event->data, "tirarfoto", event->data_len) == 0) {
+
+        //         ESP_LOGI(TAG, "Comando para tirar foto recebido!");
+
+        //         camera_fb_t* pic = take_photo();
+        //         if (!pic) {
+        //             ESP_LOGE(TAG, "Erro ao capturar foto!");
+        //             return;
+        //         }
+
+        //         esp_err_t error_http = send_photo(pic);
+
+        //         esp_camera_fb_return(pic);
+
+        //         if (error_http == ESP_OK) {
+        //             ESP_LOGI(TAG, "FOTO ENVIADA COM SUCESSO!");
+        //         } else {
+        //             ESP_LOGE(TAG, "ERRO AO ENVIAR FOTO!");
+        //         }
+        //     }
+        //     break;
+
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "MQTT desconectado!");
+            mqtt_start();
+            break;
+
+        default:
+            break;
+    }
+}
+
+void mqtt_start(void)
+{
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = "mqtt://192.168.0.158:1883",
+    };
+
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, mqtt_client);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+/********************* CAMERA *************************/
 static esp_err_t init_camera(void)
 {
     camera_config_t camera_config = {
@@ -91,22 +215,81 @@ camera_fb_t* take_photo()
     return pic;
 }
 
+/********************* HTTP *************************/
+esp_err_t send_photo(camera_fb_t* pic)
+{
+    esp_http_client_config_t config = {
+        .url = UPLOAD_URL,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE("HTTP", "Falha ao inicializar HTTP client");
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+
+    esp_err_t err = esp_http_client_open(client, pic->len);
+    if (err != ESP_OK) {
+        ESP_LOGE("HTTP", "Erro ao abrir conex�o HTTP: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    int written = esp_http_client_write(client, (const char *)pic->buf, pic->len);
+    if (written < 0) {
+        ESP_LOGE("HTTP", "Erro ao enviar imagem");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    int status = esp_http_client_get_status_code(client);
+    ESP_LOGI("HTTP", "Status HTTP recebido: %d", status);
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+
+    return (status == 200 || status == 204) ? ESP_OK : ESP_FAIL;
+}
+
 void app_main()
 {
-    esp_err_t err;
-    err = init_camera();
-    if (err != ESP_OK)
+
+    // inicia wifi e mqtt
+    nvs_flash_init();
+    wifi_init();
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+    mqtt_start();
+
+    // inicia camera
+    esp_err_t error_cam;
+    error_cam = init_camera();
+    if (error_cam != ESP_OK)
     {
-        printf("err: %s\n", esp_err_to_name(err));
+        printf("error_cam: %s\n", esp_err_to_name(error_cam));
         return;
     }
 
+    // tira foto 
     camera_fb_t* pic = take_photo();
 
+    // envia foto
+    esp_err_t error_http = send_photo(pic);
+    
+    // libera buffer     
     esp_camera_fb_return(pic);
+
+    if (error_http != ESP_OK)
+    {
+        printf("error_http: %s\n", esp_err_to_name(error_http));
+        return;
+    }
+
+    ESP_LOGI(TAG, "FOTO ENVIADA");
   
-
     vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-    printf("Everything is initialized successfully - Press Push button to take Picture\n");
 }
