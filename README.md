@@ -1,4 +1,4 @@
-# ESP32-CAM – Integração do Driver esp32-camera no ESP-IDF
+
 
 Este projeto utiliza o driver esp32-camera, necessário para capturar fotos usando módulos como ESP32-CAM (AI Thinker) e outras placas compatíveis com sensores OV2640 / OV3660 / OV5640.
 
@@ -35,3 +35,18 @@ Agora pode compilar o projeto.
 idf.py fullclean
 idf.py build
 ```
+
+PROBLEMAS ENFRENTADOS:
+
+**ESP32-CAM – Integração do Driver** 
+
+problema de compilação tamanho do build
+
+solução entrar na build -> partition Table -> Mude de Factory app, two OTA definitions (ou o padrão que estiver) para: Single app, huge app
+
+esp32-camera no ESP-IDF
+
+---------------------------------------
+Comandos uteis: 
+
+listar USBs: ls /dev/ttyUSB*
