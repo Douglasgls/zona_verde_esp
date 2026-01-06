@@ -11,6 +11,11 @@
 #include "esp_http_client.h"
 #include "esp_camera.h"
 #include "mqtt_client.h"
+#include "esp_timer.h"
+#include "rom/ets_sys.h"
+#include <math.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 // ============================================================
 // 1. CONFIGURAÇÕES GERAIS E CONSTANTES
@@ -20,13 +25,17 @@ static const char *TAG = "ZONA_VERDE";
 // --- Rede e Servidor ---
 #define WIFI_SSID       "DOUGLAS_VLINK FIBRA"
 #define WIFI_PASSWORD   "06191005c"
-#define SERVER_IP       "192.168.0.158"
+#define SERVER_IP       "192.168.0.181"
 #define ID_DEVICE      "01"
 #define STATUS_DEVICE_OCUPADO  "OCUPADO"
 
 #define UPLOAD_URL      "http://" SERVER_IP ":8000/api/plate/validate"
 #define MQTT_BROKER_URI "mqtt://" SERVER_IP ":1883"
-#define MQTT_TOPIC      "tirarfoto/acao/" ID_DEVICE
+#define MQTT_TOPIC      "camera/" ID_DEVICE
+
+// --- Pinos do HC-SR04 ---
+#define TRIGGER_PIN 15
+#define ECHO_PIN 13
 
 // --- Pinos da Câmera (AI THINKER / ESP32-CAM) ---
 #define CAM_PIN_PWDN    32
@@ -50,6 +59,8 @@ static const char *TAG = "ZONA_VERDE";
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 static TaskHandle_t s_main_task_handle = NULL;
+
+float distancia_max_interesse_cm = 25.0f;
 
 // ============================================================
 // 2. MÓDULO WI-FI
@@ -114,8 +125,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             
         case MQTT_EVENT_DATA:
             ESP_LOGI(TAG, "Mensagem MQTT recebida");
-            if (strncmp(event->data, "tirarfoto", event->data_len) == 0) {
-                ESP_LOGI(TAG, "Comando RECEBIDO. Acordando tarefa principal...");
+            if (event->data_len == strlen("picture") && strncmp(event->data, "picture", event->data_len) == 0) {
+                ESP_LOGI(TAG, "Comando RECEBIDO...");
                 if (s_main_task_handle != NULL) {
                     xTaskNotifyGive(s_main_task_handle);
                 }
@@ -154,24 +165,32 @@ esp_err_t setup_camera(void)
         .pin_d1 = CAM_PIN_D1, .pin_d0 = CAM_PIN_D0,
         .pin_vsync = CAM_PIN_VSYNC, .pin_href = CAM_PIN_HREF, .pin_pclk = CAM_PIN_PCLK,
         
-        .xclk_freq_hz = 20000000,
+        .xclk_freq_hz = 10000000,       // REDUZIDO para 10MHz (Elimina as listras)
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
         
-        .frame_size = FRAMESIZE_VGA, // 640x480
-        .jpeg_quality = 12,          // 0-63
+        .frame_size = FRAMESIZE_SVGA,   // 800x600
+        .jpeg_quality = 8,              
         .fb_count = 2,
         .grab_mode = CAMERA_GRAB_LATEST,
     };
 
-    return esp_camera_init(&config);
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) return err;
+
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_contrast(s, 2);       // Aumenta contraste (letras mais pretas)
+    s->set_saturation(s, -2);    // Diminui cor (OCR prefere tons de cinza)
+    s->set_sharpness(s, 2);      // Melhora nitidez das bordas
+    
+    return ESP_OK;
 }
 
 // ============================================================
 // 5. MÓDULO HTTP (UPLOAD)
 // ============================================================
-esp_err_t upload_photo_http(camera_fb_t* pic)
+esp_err_t upload_photo_http(camera_fb_t* pic, const char* status_msg)
 {
     esp_http_client_config_t config = {
         .url = UPLOAD_URL,
@@ -183,22 +202,26 @@ esp_err_t upload_photo_http(camera_fb_t* pic)
     esp_http_client_set_header(client, "Content-Type", "multipart/form-data; boundary=ESP32");
 
     char head_body[512];
+    
     snprintf(head_body, sizeof(head_body),
         "--ESP32\r\n"
-        "Content-Disposition: form-data; name=\"id\"\r\n\r\n01\r\n"
+        "Content-Disposition: form-data; name=\"id\"\r\n\r\n%s\r\n"
         "--ESP32\r\n"
-        "Content-Disposition: form-data; name=\"status\"\r\n\r\nOCUPADO\r\n"
+        "Content-Disposition: form-data; name=\"status\"\r\n\r\n%s\r\n" // <--- Aqui entra o status dinâmico
         "--ESP32\r\n"
         "Content-Disposition: form-data; name=\"file\"; filename=\"capture.jpg\"\r\n"
-        "Content-Type: image/jpeg\r\n\r\n"
+        "Content-Type: image/jpeg\r\n\r\n",
+        ID_DEVICE,
+        status_msg 
     );
+    
     char tail_body[] = "\r\n--ESP32--\r\n";
 
     size_t content_len = strlen(head_body) + pic->len + strlen(tail_body);
     
     esp_err_t err = esp_http_client_open(client, content_len);
     if (err != ESP_OK) {
-        ESP_LOGI(TAG, "Falha ao abrir conexão HTTP: %s", esp_err_to_name(err));
+        ESP_LOGI(TAG, "Falha na conexão HTTP: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return err;
     }
@@ -207,63 +230,169 @@ esp_err_t upload_photo_http(camera_fb_t* pic)
     esp_http_client_write(client, (const char*)pic->buf, pic->len);
     esp_http_client_write(client, tail_body, strlen(tail_body));
 
-    int content_length = esp_http_client_fetch_headers(client);
-
-    if (content_length < 0) {
-        ESP_LOGI(TAG, "ERRO: Servidor não respondeu corretamente ou timeout excedido");
-    } else {
-        int status_code = esp_http_client_get_status_code(client);
-        ESP_LOGI(TAG, "Upload Finalizado. Status Code: %d", status_code);   
-    }
-
-    int final_status = esp_http_client_get_status_code(client);
+    int status_code = esp_http_client_get_status_code(client);
     
-    esp_http_client_cleanup(client);
+    // Log para confirmar qual status foi enviado
+    ESP_LOGI(TAG, "Upload enviado com status: %s | Código HTTP: %d", status_msg, status_code);
 
-    return (final_status >= 200 && final_status < 300) ? ESP_OK : ESP_FAIL;
+    esp_http_client_cleanup(client);
+    return (status_code >= 200 && status_code < 300) ? ESP_OK : ESP_FAIL;
 }
 
 // ============================================================
-// 6. MAIN (LÓGICA PRINCIPAL)
+// 6. MÓDULO ULTRASSONICO
 // ============================================================
-void app_main()
-{
-    nvs_flash_init();
-    s_main_task_handle = xTaskGetCurrentTaskHandle();
 
-    setup_wifi();  
-    setup_mqtt();
+void pulsarTrigger(void)
+{
+    gpio_set_level(TRIGGER_PIN, 0);
+    esp_rom_delay_us(2);
+    gpio_set_level(TRIGGER_PIN, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(TRIGGER_PIN, 0);
+}
+
+float calcularDistancia(void)
+{
+    pulsarTrigger();
+
+    int64_t t0 = esp_timer_get_time();
+    while (gpio_get_level(ECHO_PIN) == 0) {
+        if ((esp_timer_get_time() - t0) > 25000) return -1.0f;
+    }
+
+    int64_t inicio = esp_timer_get_time();
+    while (gpio_get_level(ECHO_PIN) == 1) {
+        if ((esp_timer_get_time() - inicio) > 25000) return -1.0f;
+    }
+
+    int64_t fim = esp_timer_get_time();
+    return (float)(fim - inicio) * 0.0343f / 2.0f;
+}
+
+
+
+camera_fb_t* tirarFoto(void)
+{
+    for(int i = 0; i < 4; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGE(TAG, "Falha ao capturar frame");
+        return NULL;
+    }
+
+    // LOG DE DIAGNÓSTICO: Se o tamanho for baixo, a PSRAM não está ativa
+    ESP_LOGW(TAG, "FOTO CAPTURADA: %zu bytes", fb->len);
     
-    if (setup_camera() != ESP_OK) {
-        ESP_LOGE(TAG, "Erro crítico: Câmera não inicializou.");
+    return fb;
+}
+
+
+void capturar_e_enviar(const char *status)
+{
+    camera_fb_t *fb = tirarFoto();
+    if (!fb) {
+        ESP_LOGE(TAG, "Erro ao capturar foto");
         return;
     }
 
-    ESP_LOGI(TAG, ">>> SISTEMA INICIADO COM SUCESSO <<<");
+    upload_photo_http(fb, status);
+    esp_camera_fb_return(fb);
+}
 
-    while (1)
-    {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-        ESP_LOGI(TAG, "--- INICIANDO PROCESSO DE VALIDAÇÃO ---");
+void task_principal(void *pvParameters)
+{
+    bool vaga_ocupada_atualmente = false;
+    int leituras_confirmacao = 0;
+    const int leituras_minimas = 3;
 
-        camera_fb_t* pic = esp_camera_fb_get();
-        if (!pic) {
-            ESP_LOGE(TAG, "Falha na captura da câmera!");
-            continue;
+    while (1) {
+
+        // ===== COMANDO MQTT =====
+        if (ulTaskNotifyTake(pdTRUE, 0) > 0) {
+            ESP_LOGW(TAG, "Comando MQTT recebido! Tirando foto manual...");
+            capturar_e_enviar("MANUAL");
         }
 
-        vTaskDelay(5000 / portTICK_PERIOD_MS);
+        // ===== SENSOR ULTRASSÔNICO =====
+        float distancia = calcularDistancia();
 
-        ESP_LOGI(TAG, "Foto capturada: %u bytes", pic->len);
+        if (distancia > 0 && distancia < 400) {
 
-        if (upload_photo_http(pic) == ESP_OK) {
-            ESP_LOGI(TAG, "Sucesso: Fluxo completo.");
-        } else {
-            ESP_LOGE(TAG, "Erro: Falha no envio.");
+            if (distancia <= distancia_max_interesse_cm) {
+                if (!vaga_ocupada_atualmente) {
+                    leituras_confirmacao++;
+                    if (leituras_confirmacao >= leituras_minimas) {
+                        vaga_ocupada_atualmente = true;
+                        leituras_confirmacao = 0;
+
+                        ESP_LOGW(TAG, "ESTADO: OCUPADO");
+                        capturar_e_enviar("OCUPADO");
+                    }
+                } else {
+                    leituras_confirmacao = 0;
+                }
+            } 
+            else {
+                if (vaga_ocupada_atualmente) {
+                    leituras_confirmacao++;
+                    if (leituras_confirmacao >= leituras_minimas) {
+                        vaga_ocupada_atualmente = false;
+                        leituras_confirmacao = 0;
+
+                        ESP_LOGI(TAG, "ESTADO: LIVRE");
+                        capturar_e_enviar("LIVRE");
+                    }
+                } else {
+                    leituras_confirmacao = 0;
+                }
+            }
+
+            ESP_LOGI(TAG, "Distância: %.2f cm | Estado: %s",
+                     distancia,
+                     vaga_ocupada_atualmente ? "OCUPADO" : "LIVRE");
         }
 
-        esp_camera_fb_return(pic);
-        ESP_LOGI(TAG, "--- FIM DO PROCESSO. AGUARDANDO... ---");
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
+}
+// ============================================================
+// 7. MAIN (LÓGICA PRINCIPAL)
+// ============================================================
+void app_main(void)
+{
+    s_main_task_handle = NULL;
+
+    nvs_flash_init();
+
+    // GPIO Ultrassônico
+    gpio_reset_pin(TRIGGER_PIN);
+    gpio_reset_pin(ECHO_PIN);
+    gpio_set_direction(TRIGGER_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ECHO_PIN, GPIO_MODE_INPUT);
+
+    // Inicializações
+    ESP_ERROR_CHECK(setup_camera());
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    setup_wifi();
+    setup_mqtt();
+
+    // ===== CRIA TASK PRINCIPAL =====
+    xTaskCreate(
+        task_principal,        // Função da task
+        "task_principal",      // Nome
+        8192,                  // Stack (ESP32-CAM precisa)
+        NULL,                  // Parâmetros
+        5,                     // Prioridade
+        &s_main_task_handle    // Handle (para MQTT notificar)
+    );
+
+    ESP_LOGI(TAG, "Sistema inicializado com task principal");
 }

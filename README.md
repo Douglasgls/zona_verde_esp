@@ -50,3 +50,9 @@ esp32-camera no ESP-IDF
 Comandos uteis: 
 
 listar USBs: ls /dev/ttyUSB*
+
+flash: idf.py flash -p /dev/ttyUSB0
+
+container: 
+mosquito:  docker start 836438cf2ba8
+mysql: docker start 50c9fb60a1ba
