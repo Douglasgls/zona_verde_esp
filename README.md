@@ -16,6 +16,8 @@ O dispositivo executa os seguintes blocos:
 - **Câmera (esp32-camera):** captura JPEG com ajustes para melhorar OCR (contraste/nitidez/saturação).
 - **Ultrassônico:** mede distância com timeout para evitar travamento de leitura.
 - **HTTP multipart/form-data:** envia `id`, `status` e `file` (`capture.jpg`) para validação/registro.
+- **LEDS:** Leds verde e laranja indicam estado da vaga. LIVRE/RESERVADO
+- **BUZZER:** sinaliza ocupação da vaga indevida.
 
 ---
 
@@ -189,3 +191,6 @@ Se faltar espaço de firmware, ajuste a tabela de partição no menuconfig para 
 - Implementar retentativa/backoff de upload HTTP.
 - Publicar telemetria periódica de saúde (RSSI, heap, uptime).
 - Adicionar watchdog e métricas de erro por módulo.
+
+
+![altText](./montagemReal.png "Zona Verde ESP32-CAM")
