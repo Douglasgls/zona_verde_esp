@@ -23,10 +23,11 @@
 static const char *TAG = "ZONA_VERDE";
 
 // --- Rede e Servidor ---
-#define WIFI_SSID       "DOUGLAS_VLINK FIBRA"
-#define WIFI_PASSWORD   "06191005c"
-#define SERVER_IP       "192.168.0.181"
-#define ID_DEVICE      "01"
+#define WIFI_SSID       "redeDouglas"
+#define WIFI_PASSWORD   "admin123"
+#define SERVER_IP       "10.175.60.15"
+#define ID_DEVICE      "12"
+#define ONECODE        "IFPE2026"
 #define STATUS_DEVICE_OCUPADO  "OCUPADO"
 
 #define UPLOAD_URL      "http://" SERVER_IP ":8000/api/plate/validate"
@@ -36,6 +37,9 @@ static const char *TAG = "ZONA_VERDE";
 // --- Pinos do HC-SR04 ---
 #define TRIGGER_PIN 15
 #define ECHO_PIN 13
+#define LED_LIVRE 14
+#define LED_RESERVADO 2
+#define BUZZER_PIN 12
 
 // --- Pinos da Câmera (AI THINKER / ESP32-CAM) ---
 #define CAM_PIN_PWDN    32
@@ -55,12 +59,30 @@ static const char *TAG = "ZONA_VERDE";
 #define CAM_PIN_HREF    23
 #define CAM_PIN_PCLK    22
 
+// --- Variáveis Globais ---
+static bool s_alerta_ativo = false;
+static TaskHandle_t s_buzzer_task_handle = NULL;
 
 static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 static TaskHandle_t s_main_task_handle = NULL;
 
-float distancia_max_interesse_cm = 25.0f;
+float distancia_max_interesse_cm = 70.0f;
+
+
+void task_buzzer(void *pvParameters) {
+    while (1) {
+        if (s_alerta_ativo) {
+            gpio_set_level(BUZZER_PIN, 1);
+            vTaskDelay(pdMS_TO_TICKS(300)); 
+            gpio_set_level(BUZZER_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(700)); 
+        } else {
+            gpio_set_level(BUZZER_PIN, 0); 
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+}
 
 // ============================================================
 // 2. MÓDULO WI-FI
@@ -131,6 +153,33 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
                     xTaskNotifyGive(s_main_task_handle);
                 }
             }
+            // Verifica "LIVRE"
+            else if (strncmp(event->data, "LIVRE", 5) == 0) {
+                ESP_LOGI(TAG, "Status: Vaga Liberada - LED ON");
+                s_alerta_ativo = false;
+                gpio_set_level(LED_LIVRE, 1);
+                gpio_set_level(LED_RESERVADO, 0);
+            } 
+            // Verifica "OCUPADO"
+            else if (strncmp(event->data, "OCUPADO", 7) == 0) {
+                ESP_LOGI(TAG, "Status: Vaga Ocupada - LED OFF");
+                gpio_set_level(LED_LIVRE, 0);
+            }
+            // Verifica "RESERVADO"
+            else if (strncmp(event->data, "RESERVADO", 9) == 0) {
+                ESP_LOGI(TAG, "Status: Vaga Reservada - LED ON");
+                gpio_set_level(LED_RESERVADO, 1);
+                gpio_set_level(LED_LIVRE, 0);
+            }
+            // --- COMANDOS DO BUZZER (TASK) ---
+            else if (strncmp(event->data, "ALERTA_ON", 9) == 0) {
+                ESP_LOGW(TAG, "ALERTA ATIVADO VIA MQTT");
+                s_alerta_ativo = true;
+            }
+            else if (strncmp(event->data, "ALERTA_OFF", 10) == 0) {
+                ESP_LOGI(TAG, "ALERTA DESATIVADO VIA MQTT");
+                s_alerta_ativo = false;
+            }
             break;
 
         case MQTT_EVENT_DISCONNECTED:
@@ -170,7 +219,7 @@ esp_err_t setup_camera(void)
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
         
-        .frame_size = FRAMESIZE_SVGA,   // 800x600
+        .frame_size = FRAMESIZE_XGA,   // 800x600
         .jpeg_quality = 8,              
         .fb_count = 2,
         .grab_mode = CAMERA_GRAB_LATEST,
@@ -205,13 +254,13 @@ esp_err_t upload_photo_http(camera_fb_t* pic, const char* status_msg)
     
     snprintf(head_body, sizeof(head_body),
         "--ESP32\r\n"
-        "Content-Disposition: form-data; name=\"id\"\r\n\r\n%s\r\n"
+        "Content-Disposition: form-data; name=\"onecode\"\r\n\r\n%s\r\n"
         "--ESP32\r\n"
         "Content-Disposition: form-data; name=\"status\"\r\n\r\n%s\r\n" // <--- Aqui entra o status dinâmico
         "--ESP32\r\n"
         "Content-Disposition: form-data; name=\"file\"; filename=\"capture.jpg\"\r\n"
         "Content-Type: image/jpeg\r\n\r\n",
-        ID_DEVICE,
+        ONECODE,
         status_msg 
     );
     
@@ -376,6 +425,23 @@ void app_main(void)
     gpio_reset_pin(ECHO_PIN);
     gpio_set_direction(TRIGGER_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction(ECHO_PIN, GPIO_MODE_INPUT);
+
+    // GPIO LED LIVRE
+    gpio_reset_pin(LED_LIVRE);
+    gpio_set_direction(LED_LIVRE, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_LIVRE, 1);
+
+    // GPIO LED RESERVADO
+    gpio_reset_pin(LED_RESERVADO);
+    gpio_set_direction(LED_RESERVADO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_RESERVADO, 0);
+
+    // GPIO BUZZER
+    gpio_reset_pin(BUZZER_PIN);
+    gpio_set_direction(BUZZER_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(BUZZER_PIN, 0);
+
+    xTaskCreate(task_buzzer, "task_buzzer", 2048, NULL, 2, &s_buzzer_task_handle);
 
     // Inicializações
     ESP_ERROR_CHECK(setup_camera());
